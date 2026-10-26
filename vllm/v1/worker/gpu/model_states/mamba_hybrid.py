@@ -18,7 +18,7 @@ from vllm.v1.attention.backends.short_conv_attn import (
     ShortConvAttentionMetadataBuilder,
 )
 from vllm.v1.core.sched.output import NewRequestData
-from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheConfig, MambaSpec
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
 from vllm.v1.worker.gpu.block_table import BlockTables
@@ -83,6 +83,16 @@ class MambaHybridModelState(DefaultModelState):
     ) -> None:
         super().__init__(vllm_config, model, encoder_cache, device)
         self.cache_config = vllm_config.cache_config
+        # StartLux-Decision Instant reads its prompt with bidirectional
+        # attention on the full-attention layers; the linear-attention layers
+        # keep their causal recurrent state.
+        self._prompt_bidirectional = (
+            getattr(vllm_config.model_config.hf_config, "jev_prompt_attention", None)
+            == "bidirectional"
+        )
+        self._causal_by_group: dict[int, bool] | None = None
+        if self._prompt_bidirectional:
+            self._check_prompt_bidirectional_config(vllm_config)
         self.num_accepted_tokens_gpu = torch.ones(
             self.max_num_reqs, dtype=torch.int32, device=self.device
         )
@@ -108,6 +118,54 @@ class MambaHybridModelState(DefaultModelState):
             self._mamba_group_ids: list[int] = []
             self._mamba_spec: MambaSpec | None = None
             self._mamba_state_copy_funcs: MambaStateCopyFuncsByType | None = None
+
+    @staticmethod
+    def _check_prompt_bidirectional_config(vllm_config: VllmConfig) -> None:
+        """A bidirectional prompt row must be prefilled in a single step."""
+        scheduler = vllm_config.scheduler_config
+        cache = vllm_config.cache_config
+        parallel = vllm_config.parallel_config
+        model = vllm_config.model_config
+        bad = []
+        if scheduler.enable_chunked_prefill:
+            bad.append("--no-enable-chunked-prefill")
+        if getattr(scheduler, "long_prefill_token_threshold", 0):
+            bad.append("long_prefill_token_threshold must be 0")
+        if scheduler.max_num_batched_tokens < model.max_model_len:
+            bad.append(
+                f"max_num_batched_tokens ({scheduler.max_num_batched_tokens}) must be "
+                f">= max_model_len ({model.max_model_len})"
+            )
+        if cache.enable_prefix_caching:
+            bad.append("--no-enable-prefix-caching")
+        if vllm_config.speculative_config is not None:
+            bad.append("speculative decoding is not supported")
+        if (
+            getattr(parallel, "decode_context_parallel_size", 1) != 1
+            or getattr(parallel, "prefill_context_parallel_size", 1) != 1
+        ):
+            bad.append("context parallelism is not supported")
+        if getattr(parallel, "use_ubatching", False):
+            bad.append("ubatching (DBO) is not supported")
+        if str(cache.cache_dtype) not in ("auto", "bfloat16", "float16"):
+            bad.append(f"kv cache dtype {cache.cache_dtype} is not supported")
+        if bad:
+            raise ValueError(
+                "This model reads its prompt with bidirectional attention, so the "
+                "whole prompt must be prefilled in one step: " + "; ".join(bad)
+            )
+
+    def _attn_causal(self, kv_cache_config: KVCacheConfig) -> bool | dict[int, bool]:
+        """Per-group causal flag: only the full-attention groups read the prompt
+        bidirectionally, the linear-attention groups keep their causal state."""
+        if not self._prompt_bidirectional:
+            return True
+        if self._causal_by_group is None:
+            self._causal_by_group = {
+                i: not isinstance(group.kv_cache_spec, AttentionSpec)
+                for i, group in enumerate(kv_cache_config.kv_cache_groups)
+            }
+        return self._causal_by_group
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         super().add_request(req_index, new_req_data)
@@ -340,6 +398,7 @@ class MambaHybridModelState(DefaultModelState):
             model_specific_attn_metadata=mamba_attn_metadata,
             for_cudagraph_capture=for_capture,
             rswa_prefix_lens=input_batch.prompt_lens,
+            causal=self._attn_causal(kv_cache_config),
         )
         if self.recoverssm is not None:
             self.recoverssm.record_step(
